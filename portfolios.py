@@ -1,13 +1,13 @@
-# mean_variance_two_plots_with_labels.py
+# mean_variance_two_plots_with_labels_longonly.py
 # -----------------------------------------------------------------------------
 # Build FACTOR covariance (FF5+MOM) and SAMPLE covariance, compute:
-#   • Global Minimum-Variance (GMV) and Tangency portfolios for BOTH
+#   • Global Minimum-Variance (GMV) and Tangency portfolios for BOTH (LONG-ONLY)
 # Make TWO separate charts (one per model) with:
 #   • Efficient Frontier in BLACK (solid)
 #   • CAL dashed in model color
 #   • GMV/Tangency markers with DATA LABELS (σ, μ, Sharpe)
 #   • Frontier extends at least to the Tangency volatility on the x-axis
-# Print a compact (annualized) GMV performance comparison.
+# Print a compact (annualized) GMV performance comparison and Top-7 allocations.
 # -----------------------------------------------------------------------------
 
 from pathlib import Path
@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.ticker import PercentFormatter
+from scipy.optimize import minimize  # <-- long-only solver (SLSQP)
 import os
 
 # --------------------- Paths & constants ---------------------
@@ -107,65 +108,102 @@ def build_factor_cov(B: pd.DataFrame, F: pd.DataFrame, rvar: pd.Series) -> pd.Da
     Sigma = B.values @ Sigma_F @ B.values.T + D      # NxN
     return pd.DataFrame(Sigma, index=B.index, columns=B.index)
 
-# ===================== Mean–Variance helpers =====================
+# ===================== Mean–Variance helpers (LONG-ONLY) =====================
 
 def _regularize_cov(S: pd.DataFrame, ridge: float = 1e-8) -> pd.DataFrame:
     S = (S + S.T) / 2.0
     return S + np.eye(S.shape[0]) * ridge
 
-def gmv_weights(S: pd.DataFrame) -> pd.Series:
+def _solve_long_only(objective, grad, w0, bounds, cons):
+    res = minimize(objective, w0, method="SLSQP", jac=grad, bounds=bounds, constraints=cons,
+                   options=dict(maxiter=1000, ftol=1e-12, disp=False))
+    if not res.success:
+        raise RuntimeError(f"Optimization failed: {res.message}")
+    # clip tiny negatives from numerical noise
+    w = np.clip(res.x, 0, None)
+    w = w / w.sum()
+    return w
+
+def gmv_weights_long_only(S: pd.DataFrame) -> pd.Series:
     S = _regularize_cov(S)
-    invS = np.linalg.inv(S.values)
-    ones = np.ones(S.shape[0])
-    A = ones @ invS @ ones
-    w = invS @ ones / A
+    N = S.shape[0]
+    ones = np.ones(N)
+    bounds = [(0.0, 1.0)] * N
+    cons = ({'type':'eq', 'fun': lambda w: w.sum() - 1.0,
+             'jac': lambda w: np.ones_like(w)})
+    def obj(w): return w @ (S.values @ w)
+    def grad(w): return 2.0 * (S.values @ w)
+    w0 = np.full(N, 1.0/N)
+    w = _solve_long_only(obj, grad, w0, bounds, cons)
     return pd.Series(w, index=S.index)
 
-def tangency_weights(mu: pd.Series, S: pd.DataFrame, rf_daily: float) -> pd.Series:
+def tangency_weights_long_only(mu: pd.Series, S: pd.DataFrame, rf_daily: float) -> pd.Series:
     S = _regularize_cov(S)
+    N = S.shape[0]
     mu_ex = mu.values - rf_daily
-    invS = np.linalg.inv(S.values)
-    w_unnorm = invS @ mu_ex
-    w = w_unnorm / (np.ones(len(mu)) @ w_unnorm)
+    bounds = [(0.0, 1.0)] * N
+    cons = ({'type':'eq', 'fun': lambda w: w.sum() - 1.0,
+             'jac': lambda w: np.ones_like(w)})
+    def obj(w):
+        a = mu_ex @ w
+        b = np.sqrt(w @ (S.values @ w))
+        if b <= 0: return 1e6
+        return -a / b  # maximize Sharpe -> minimize negative
+    def grad(w):
+        Sw = S.values @ w
+        b = np.sqrt(w @ Sw)
+        a = mu_ex @ w
+        if b <= 0: return np.zeros_like(w)
+        # d(-a/b)/dw = -mu_ex/b + a*(Sw)/b^3
+        return -mu_ex / b + a * Sw / (b**3)
+    w0 = np.full(N, 1.0/N)
+    w = _solve_long_only(obj, grad, w0, bounds, cons)
     return pd.Series(w, index=mu.index)
 
-def efficient_frontier_cover(mu: pd.Series, S: pd.DataFrame,
-                             r_gmv: float, vol_target: float,
-                             npts: int = 180) -> tuple[np.ndarray, np.ndarray]:
+def efficient_frontier_long_only(mu: pd.Series, S: pd.DataFrame,
+                                 rf_daily: float,
+                                 vol_target: float | None = None,
+                                 npts: int = 140):
     """
-    Efficient frontier that **guarantees** the x-extent reaches at least
-    'vol_target' by expanding the target-return grid if needed.
+    Generate EF by solving long-only mean–variance problems over a lambda grid:
+        min  w'Sw - λ * (mu'w)
+        s.t. sum(w)=1, w>=0
+    Expand λ until EF reaches vol_target (if provided).
     """
     S = _regularize_cov(S)
+    N = S.shape[0]
     mu_v = mu.values
-    invS = np.linalg.inv(S.values)
-    ones = np.ones(len(mu_v))
+    bounds = [(0.0, 1.0)] * N
+    cons = ({'type':'eq', 'fun': lambda w: w.sum() - 1.0,
+             'jac': lambda w: np.ones_like(w)})
 
-    A = ones @ invS @ ones
-    B = ones @ invS @ mu_v
-    C = mu_v @ invS @ mu_v
-    D = A*C - B*B
+    def solve_lambda(lmbda, w_start):
+        def obj(w): return w @ (S.values @ w) - lmbda * (mu_v @ w)
+        def grad(w): return 2.0 * (S.values @ w) - lmbda * mu_v
+        return _solve_long_only(obj, grad, w_start, bounds, cons)
 
-    def _frontier(r_min, r_max):
-        r_grid = np.linspace(r_min, r_max, npts)
-        vols = []
-        for r in r_grid:
-            lam = (C - B*r) / D
-            gam = (A*r - B) / D
-            w = invS @ (lam*ones + gam*mu_v)
-            vols.append(np.sqrt(w @ S.values @ w))
-        return np.array(vols), r_grid
+    lambdas = np.logspace(-3, 3, npts)
+    vols, rets = [], []
+    w_prev = np.full(N, 1.0/N)
 
-    r_min = r_gmv
-    r_max = max(mu_v.max(), r_gmv)
-    vols, rets = _frontier(r_min, r_max)
+    for lmbda in lambdas:
+        w_prev = solve_lambda(lmbda, w_prev)
+        Sw = S.values @ w_prev
+        vols.append(np.sqrt(w_prev @ Sw))
+        rets.append(mu_v @ w_prev)
 
-    # Expand r_max until the frontier reaches the target volatility
-    it = 0
-    while np.max(vols) < vol_target * 1.02 and it < 12:
-        r_max *= 1.25
-        vols, rets = _frontier(r_min, r_max)
-        it += 1
+    vols = np.array(vols)
+    rets = np.array(rets)
+
+    # extend if needed to cover at least the tangency volatility
+    if vol_target is not None and (np.max(vols) < 1.02 * vol_target):
+        lambdas2 = np.logspace(3, 5, npts//3)
+        for lmbda in lambdas2:
+            w_prev = solve_lambda(lmbda, w_prev)
+            Sw = S.values @ w_prev
+            vols = np.append(vols, np.sqrt(w_prev @ Sw))
+            rets = np.append(rets, mu_v @ w_prev)
+
     return vols, rets
 
 def ann_stats(w: pd.Series, mu_daily: pd.Series, S_daily: pd.DataFrame, rf_daily: float):
@@ -224,7 +262,7 @@ def plot_single_model(model_name: str, color: str, ef, gmv, tan, rf_ann: float,
                 bbox=dict(boxstyle="round,pad=0.25", fc="white", ec=color, alpha=0.9))
 
     # Axis formatting
-    ax.set_title(f"Mean–Variance Frontier (annualized) — {model_name}")
+    ax.set_title(f"Mean–Variance Frontier (annualized) — {model_name} (Long-only)")
     ax.set_xlabel("Volatility (σ)")
     ax.set_ylabel("Expected Return (μ)")
     ax.xaxis.set_major_formatter(PercentFormatter(1.0, decimals=0))
@@ -277,13 +315,11 @@ def main():
     mu_daily = R.mean()
     rf_daily = float(factors["RF"].mean())
 
-    # GMV
-    w_gmv_sample = gmv_weights(Sigma_sample)
-    w_gmv_factor = gmv_weights(Sigma_factor.loc[tickers, tickers])
-
-    # Tangency
-    w_tan_sample = tangency_weights(mu_daily, Sigma_sample, rf_daily)
-    w_tan_factor = tangency_weights(mu_daily, Sigma_factor.loc[tickers, tickers], rf_daily)
+    # LONG-ONLY GMV & Tangency
+    w_gmv_sample = gmv_weights_long_only(Sigma_sample)
+    w_gmv_factor = gmv_weights_long_only(Sigma_factor.loc[tickers, tickers])
+    w_tan_sample = tangency_weights_long_only(mu_daily, Sigma_sample, rf_daily)
+    w_tan_factor = tangency_weights_long_only(mu_daily, Sigma_factor.loc[tickers, tickers], rf_daily)
 
     # Daily metrics (ret, vol)
     def port_point(w, S):
@@ -296,11 +332,11 @@ def main():
     ret_tan_s_d, vol_tan_s_d = port_point(w_tan_sample,  Sigma_sample)
     ret_tan_f_d, vol_tan_f_d = port_point(w_tan_factor,  Sigma_factor.loc[tickers, tickers])
 
-    # Efficient frontiers — ensure they reach tangency volatility on x-axis
-    vols_s_d, rets_s_d = efficient_frontier_cover(mu_daily, Sigma_sample,
-                                                  r_gmv=ret_gmv_s_d, vol_target=vol_tan_s_d, npts=220)
-    vols_f_d, rets_f_d = efficient_frontier_cover(mu_daily, Sigma_factor.loc[tickers, tickers],
-                                                  r_gmv=ret_gmv_f_d, vol_target=vol_tan_f_d, npts=220)
+    # Efficient frontiers (LONG-ONLY) — ensure they reach tangency volatility
+    vols_s_d, rets_s_d = efficient_frontier_long_only(mu_daily, Sigma_sample,
+                                                      rf_daily, vol_target=vol_tan_s_d, npts=220)
+    vols_f_d, rets_f_d = efficient_frontier_long_only(mu_daily, Sigma_factor.loc[tickers, tickers],
+                                                      rf_daily, vol_target=vol_tan_f_d, npts=220)
 
     # Annualize
     rf_ann   = rf_daily * TRADING_DAYS
@@ -322,7 +358,7 @@ def main():
         color=COL_SAMPLE,
         ef=ef_s, gmv=gmv_s, tan=tan_s, rf_ann=rf_ann,
         data_note=data_note,
-        outpath=RESULTS_DIR / "mv_frontier_sample_labeled.png"
+        outpath=RESULTS_DIR / "mv_frontier_sample_labeled_longonly.png"
     )
 
     plot_single_model(
@@ -330,7 +366,7 @@ def main():
         color=COL_FACTOR,
         ef=ef_f, gmv=gmv_f, tan=tan_f, rf_ann=rf_ann,
         data_note=data_note,
-        outpath=RESULTS_DIR / "mv_frontier_factor_labeled.png"
+        outpath=RESULTS_DIR / "mv_frontier_factor_labeled_longonly.png"
     )
 
     # Performance comparison (annualized, GMV)
@@ -338,18 +374,44 @@ def main():
     gmv_f_stats = ann_stats(w_gmv_factor,  mu_daily, Sigma_factor.loc[tickers, tickers], rf_daily)
 
     comp = pd.DataFrame({
-        "GMV – Sample Σ": {"Ann. Return": gmv_s_stats[0], "Ann. Vol": gmv_s_stats[1], "Ann. Sharpe": gmv_s_stats[2]},
-        "GMV – Factor Σ": {"Ann. Return": gmv_f_stats[0], "Ann. Vol": gmv_f_stats[1], "Ann. Sharpe": gmv_f_stats[2]},
+        "GMV – Sample Σ (LO)": {"Ann. Return": gmv_s_stats[0], "Ann. Vol": gmv_s_stats[1], "Ann. Sharpe": gmv_s_stats[2]},
+        "GMV – Factor Σ (LO)": {"Ann. Return": gmv_f_stats[0], "Ann. Vol": gmv_f_stats[1], "Ann. Sharpe": gmv_f_stats[2]},
     })
-    comp["Difference (Factor − Sample)"] = comp["GMV – Factor Σ"] - comp["GMV – Sample Σ"]
+    comp["Difference (Factor − Sample)"] = comp["GMV – Factor Σ (LO)"] - comp["GMV – Sample Σ (LO)"]
     comp = comp.round(5)
-    out_csv = RESULTS_DIR / "gmv_performance_comparison.csv"
+    out_csv = RESULTS_DIR / "gmv_performance_comparison_longonly.csv"
     comp.to_csv(out_csv, float_format="%.5f")
 
-    print("\n=== GMV Performance (annualized) ===")
+    print("\n=== GMV Performance (annualized, LONG-ONLY) ===")
     print(comp.to_string())
-    print(f"\nSaved charts:\n  - {RESULTS_DIR / 'mv_frontier_sample_labeled.png'}\n  - {RESULTS_DIR / 'mv_frontier_factor_labeled.png'}")
+    print(f"\nSaved charts:\n  - {RESULTS_DIR / 'mv_frontier_sample_labeled_longonly.png'}\n  - {RESULTS_DIR / 'mv_frontier_factor_labeled_longonly.png'}")
     print(f"Saved comparison CSV: {out_csv}")
+
+    # --- Step 3: Top-7 allocations (in-sample GMV), simple & clear ---
+    def top_allocations(w: pd.Series, k: int = 7):
+        order = w.abs().sort_values(ascending=False).index
+        top = w.loc[order].head(k)
+        table = (100 * top).round(2).to_frame("Weight (%)")  # sign preserved (will be ≥0 here)
+        largest = float(top.abs().iloc[0])                   # e.g., 0.18 = 18%
+        topk_share = float(top.abs().sum())                  # <= 1.0 for long-only
+        return table, largest, topk_share
+
+    tbl_s, largest_s, share7_s = top_allocations(w_gmv_sample, k=7)
+    tbl_f, largest_f, share7_f = top_allocations(w_gmv_factor, k=7)
+
+    print("\n=== GMV — Sample Σ (LO) : Top 7 positions ===")
+    print(tbl_s.to_string())
+    print(f"Largest single position: {largest_s*100:.2f}%")
+    print(f"Sum of weights in top 7: {share7_s*100:.2f}%")
+
+    print("\n=== GMV — Factor Σ (LO) : Top 7 positions ===")
+    print(tbl_f.to_string())
+    print(f"Largest single position: {largest_f*100:.2f}%")
+    print(f"Sum of weights in top 7: {share7_f*100:.2f}%")
+
+    # Optional: save the small tables
+    (tbl_s.to_csv(RESULTS_DIR / "gmv_sample_top7_longonly.csv"))
+    (tbl_f.to_csv(RESULTS_DIR / "gmv_factor_top7_longonly.csv"))
 
 if __name__ == "__main__":
     main()
